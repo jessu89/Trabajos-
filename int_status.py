@@ -257,3 +257,4 @@ if __name__ == "__main__":
         except serial.SerialException:
             print("\n⚠ Conexión perdida. Intentando reconectar...")
             ser = conectar_dispositivo()
+#flores#
