@@ -1,2 +1,6 @@
-Serie,Port,Device,User,Password,Ip-domain
-FTX144582PH,COM16,Router1,Cisco,Cisco,cisco.local
+Serie,Port,Device,User,Password,Ip-domain,INTERFACE,IP_ADDRESS,STATUS,PROTO
+FTX1225207P,COM16,Router1,Cisco,Cisco,cisco.local,FastEthernet0/0,unassigned,administratively down,down
+,,,,,,Service-Engine0/0,unassigned,administratively down,down
+,,,,,,FastEthernet0/1,unassigned,administratively down,down
+,,,,,,Serial0/1/0,unassigned,administratively down,down
+,,,,,,Serial0/1/1,unassigned,administratively down,down

@@ -1,214 +1,167 @@
+import os
+import sys
 import serial
 import serial.tools.list_ports
 import time
 import pandas as pd
-import os
-import re
+import textfsm
 
 # ╔════════════════════════════════════════════════════════════════╗
-#   FUNCIONES AUXILIARES
+#   CONFIGURACIÓN AUTOMÁTICA DE NTC-TEMPLATES
 # ╚════════════════════════════════════════════════════════════════╝
 
-def clear_console():
-    os.system("cls" if os.name == "nt" else "clear")
+def setup_ntc_templates():
+    """Detecta automáticamente la ruta de ntc_templates y la asigna a NET_TEXTFSM."""
+    try:
+        import ntc_templates
+        templates_path = os.path.join(os.path.dirname(ntc_templates.__file__), "templates")
+        if os.path.isdir(templates_path):
+            os.environ["NET_TEXTFSM"] = templates_path
+            print(f"✅ NET_TEXTFSM detectado: {templates_path}")
+        else:
+            print("⚠ No se encontró carpeta templates dentro de ntc_templates.")
+    except ImportError:
+        print("❌ ntc-templates no está instalado. Instálalo con: pip install ntc-templates")
+        sys.exit(1)
+
+setup_ntc_templates()
+
+# ╔════════════════════════════════════════════════════════════════╗
+#   FUNCIONES DE SERIAL Y COMUNICACIÓN
+# ╚════════════════════════════════════════════════════════════════╝
 
 def listar_puertos():
     """Lista los puertos disponibles."""
     return list(serial.tools.list_ports.comports())
 
-def conectar_dispositivo(ser=None):
-    """Intenta conectar al primer puerto disponible.
-       Si ya hay un puerto abierto, lo cierra antes de abrir otro.
-    """
-    # 🔒 Cierra el puerto anterior si existe
-    if ser and ser.is_open:
-        try:
-            ser.close()
-            print("🔌 Puerto anterior cerrado.")
-        except:
-            pass  
-
+def conectar_dispositivo():
+    """Conecta al primer puerto disponible."""
     while True:
         puertos = listar_puertos()
         if not puertos:
-            print("❌ No se detectaron puertos disponibles. Conecta un dispositivo...")
+            print("❌ No se detectaron puertos disponibles.")
             time.sleep(2)
             continue
 
-        print("\n🔍 Puertos detectados:")
         for i, p in enumerate(puertos, 1):
             print(f"{i}. {p.device} - {p.description}")
 
+        port = puertos[0].device
         try:
-            port = puertos[0].device  # Toma el primero automáticamente
             ser = serial.Serial(port, baudrate=9600, timeout=1)
             time.sleep(2)
-            print(f"\n✅ Conectado al dispositivo en {port}")
+            print(f"✅ Conectado a {port}")
             return ser
         except Exception as e:
             print(f"❌ Error al conectar en {port}: {e}")
             time.sleep(2)
 
-def send_command(ser, command, base_delay=2, max_retries=3):
+def send_command(ser, command, base_delay=2):
+    """Envía un comando al router y devuelve la salida limpia."""
     ser.reset_input_buffer()
     ser.write((command + "\r\n").encode())
+    time.sleep(base_delay)
 
-    output, delay = "", base_delay
-    for intento in range(max_retries):
-        time.sleep(delay)
-        chunk = ser.read(ser.in_waiting).decode(errors="ignore")
-
-        if chunk:
-            output += chunk
-            while True:
-                time.sleep(0.5)
-                more = ser.read(ser.in_waiting).decode(errors="ignore")
-                if not more:
-                    break
-                output += more
+    output = ser.read(ser.in_waiting).decode(errors="ignore")
+    while True:
+        time.sleep(0.5)
+        more = ser.read(ser.in_waiting).decode(errors="ignore")
+        if not more:
             break
-        else:
-            delay += 2
+        output += more
 
-    return output.strip() if output.strip() else "⚠ No hubo respuesta del dispositivo."
-
-def get_serial(ser):
-    send_command(ser, "terminal length 0")
-    output = send_command(ser, "show inventory", base_delay=3)
-    match = re.search(r"SN:\s*([A-Z0-9]+)", output)
-    return match.group(1) if match else None
+    # Limpieza
+    lines = output.splitlines()
+    clean_lines = [l for l in lines if not l.strip().lower().startswith(command.lower())]
+    return "\n".join(clean_lines).strip()
 
 # ╔════════════════════════════════════════════════════════════════╗
-#   CONFIGURACIÓN DE DISPOSITIVO
+#   FUNCIONES DE PARSEO Y CSV
 # ╚════════════════════════════════════════════════════════════════╝
 
-def configure_device(ser, hostname, user, password, domain):
+def parse_show_ip_interface_brief(raw_output):
+    """Parsea show ip interface brief usando TextFSM."""
+    template_path = os.path.join(os.environ["NET_TEXTFSM"], "cisco_ios_show_ip_interface_brief.textfsm")
+    with open(template_path) as tpl:
+        fsm = textfsm.TextFSM(tpl)
+        parsed_data = fsm.ParseText(raw_output)
+
+    headers = fsm.header
+    return pd.DataFrame(parsed_data, columns=headers)
+
+def obtener_interfaces_y_guardar(ser, csv_path):
+    """Ejecuta show ip interface brief, organiza datos en una sola línea y guarda en CSV."""
+    router_ip = input("\n🌐 Ingresa la IP del router: ").strip()
+    if not router_ip:
+        print("⚠ IP inválida.")
+        return
+
+    print("\n📡 Obteniendo información de interfaces...")
+    send_command(ser, "terminal length 0")
+    output = send_command(ser, "show ip interface brief", base_delay=3)
+
     try:
-        print(f"\n🔗 Configurando dispositivo: {hostname}")
+        df_interfaces = parse_show_ip_interface_brief(output)
+        print("\n📋 Interfaces detectadas:")
+        print(df_interfaces)
 
-        serial_num = get_serial(ser)
-        if not serial_num:
-            print("⚠ No se pudo obtener el número de serie. Saltando...")
-            return False
+        # Aplanar los datos: poner cada interfaz en columnas horizontales
+        row_data = {"Router_IP": router_ip}
+        for i, row in df_interfaces.iterrows():
+            idx = i + 1
+            row_data[f"Int{idx}"] = row["INTERFACE"]
+            row_data[f"IP{idx}"] = row["IP-ADDRESS"]
+            row_data[f"Status{idx}"] = row["STATUS"]
 
-        if hostname[1:] != serial_num:
-            print(f"⚠ Serie del dispositivo ({serial_num}) ≠ Esperada ({hostname[1:]})")
-            return False
+        # Convertir a DataFrame de una sola fila
+        df_row = pd.DataFrame([row_data])
 
-        comandos = [
-            "enable",
-            "configure terminal",
-            f"hostname {hostname}",
-            f"username {user} privilege 15 secret {password}",
-            f"ip domain-name {domain}",
-            "crypto key generate rsa modulus 1024",
-            "line vty 0 4",
-            "login local",
-            "transport input ssh",
-            "transport output ssh",
-            "exit",
-            "ip ssh version 2",
-            "end",
-            "write memory"
-        ]
+        # Si el CSV ya existe, agregar la nueva fila
+        if os.path.exists(csv_path):
+            df_csv = pd.read_csv(csv_path)
+            df_csv = pd.concat([df_csv, df_row], ignore_index=True)
+        else:
+            df_csv = df_row
 
-        for cmd in comandos:
-            delay = 5 if "crypto key" in cmd or "write memory" in cmd else 2
-            send_command(ser, cmd, base_delay=delay)
-
-        print(f"✅ Configuración aplicada correctamente en {hostname}")
-        return True
+        df_csv.to_csv(csv_path, index=False)
+        print(f"\n✅ Datos guardados en una sola línea en: {csv_path}")
 
     except Exception as e:
-        print(f"❌ Error al configurar {hostname}: {e}")
-        return False
+        print(f"⚠ Error al parsear interfaces: {e}")
+        print("Salida cruda del dispositivo:")
+        print(output)
 
 # ╔════════════════════════════════════════════════════════════════╗
-#   MENÚS
+#   MENÚ PRINCIPAL
 # ╚════════════════════════════════════════════════════════════════╝
 
 def mostrar_menu():
-    clear_console()
     print("""
 ╔════════════════════════════════════════════════╗
-║                 MENÚ PRINCIPAL                 ║
+║                MENÚ PRINCIPAL                  ║
 ╚════════════════════════════════════════════════╝
-1. Mandar comandos manualmente
-2. Hacer configuraciones iniciales desde CSV
-3. Reconectar a otro puerto
+1. Obtener interfaces y direcciones IP
 0. Salir
 """)
 
-def menu_comandos_manual(ser):
-    while True:
-        cmd = input("📥 Ingresa el comando (o 'exit' para salir): ")
-        if cmd.lower() == "exit":
-            break
-        output = send_command(ser, cmd, base_delay=3)
-        print(f"\n📤 Respuesta:\n{output}")
-    input("Presione ENTER para volver al menú...")
-
-def flujo_configuracion_csv(ser):
-    clear_console()
-    df = pd.read_csv(r"C:\Users\jessu\OneDrive\Documentos\venv\Data.csv")
-
-    print("\n📂 Dispositivos en archivo CSV:")
-    print(df)
-
-    Hostnames = [str(d).strip()[0] + str(s).strip() for d, s in zip(df["Device"], df["Serie"])]
-    dispositivos = [(h, u, pas, dom) for u, pas, dom, h in zip(
-        df["User"], df["Password"], df["Ip-domain"], Hostnames
-    )]
-
-    print("\n📋 Lista de dispositivos:")
-    for dev in dispositivos:
-        print(dev)
-    input("Presione ENTER para continuar...")
-
-    configurados, saltados = [], []
-
-    for idx, (h, u, pas, dom) in enumerate(dispositivos, start=1):
-        clear_console()
-        print(f"\n➡ Configurando dispositivo {idx}: {h}")
-        if configure_device(ser, h, u, pas, dom):
-            configurados.append(h)
-        else:
-            saltados.append(h)
-        print("=================================================")
-        input("Presione ENTER para continuar...")
-
-    clear_console()
-    print("📊 Resumen de configuración:")
-    print(f"✅ Configurados ({len(configurados)}): {configurados}")
-    print(f"⚠ Saltados ({len(saltados)}): {saltados}")
-    input("Presione ENTER para volver al menú...")
-
 # ╔════════════════════════════════════════════════════════════════╗
-#   MAIN LOOP
+#   MAIN
 # ╚════════════════════════════════════════════════════════════════╝
 
 if __name__ == "__main__":
     ser = conectar_dispositivo()
+    csv_path = r"C:\Users\jessu\OneDrive\Documentos\venv\Data.csv"
 
     while True:
-        try:
-            mostrar_menu()
-            opcion = input("Selecciona una opción: ")
-            if opcion == "1":
-                menu_comandos_manual(ser)
-            elif opcion == "2":
-                flujo_configuracion_csv(ser)
-            elif opcion == "3":
-                print("\n♻ Reconectando a otro puerto...")
-                ser = conectar_dispositivo(ser)  # <-- 🔥 aquí ya se cierra el anterior
-            elif opcion == "0":
-                print("👋 Cerrando conexión y saliendo...")
-                if ser and ser.is_open:
-                    ser.close()
-                break
-            else:
-                print("❌ Opción inválida.")
-                input("Presione ENTER para continuar...")
-        except serial.SerialException:
-            print("\n⚠ Conexión perdida. Intentando reconectar...")
-            ser = conectar_dispositivo(ser)
+        mostrar_menu()
+        opcion = input("Selecciona una opción: ")
+
+        if opcion == "1":
+            obtener_interfaces_y_guardar(ser, csv_path)
+            input("\nPresiona ENTER para volver al menú...")
+        elif opcion == "0":
+            print("👋 Saliendo y cerrando conexión...")
+            ser.close()
+            break
+        else:
+            print("❌ Opción inválida.")

@@ -1,0 +1,2 @@
+Hostname,Interface_1,IP_1,Status_1,Protocol_1,Interface_2,IP_2,Status_2,Protocol_2,Interface_3,IP_3,Status_3,Protocol_3,Interface_4,IP_4,Status_4,Protocol_4,Interface_5,IP_5,Status_5,Protocol_5
+FTX1225207P#,FastEthernet0/0,unassigned,administratively down,down,Service-Engine0/0,unassigned,administratively down,down,FastEthernet0/1,unassigned,administratively down,down,Serial0/1/0,unassigned,administratively down,down,Serial0/1/1,unassigned,administratively down,down
