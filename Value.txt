@@ -6,4 +6,5 @@ Value STATUS (administratively down|up|down)
 Value PROTOCOL (up|down)
 
 Start
+  ^\s*Interface\s+IP-Address\s+OK\?\s+Method\s+Status\s+Protocol -> Record
   ^${INTERFACE}\s+${IP_ADDRESS}\s+${OK}\s+${METHOD}\s+${STATUS}\s+${PROTOCOL} -> Record

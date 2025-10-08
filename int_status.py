@@ -1,128 +1,169 @@
 import serial
 import serial.tools.list_ports
-import pandas as pd
 import os
+import time
+import pandas as pd
 import textfsm
+
+CSV_FILE = "routers_interfaces.csv"
+TEMPLATE_FILE = "Value.txt"
 
 # ╔════════════════════════════════════════════════════════════════╗
 #   FUNCIONES AUXILIARES
 # ╚════════════════════════════════════════════════════════════════╝
 
 def detectar_puerto_serial():
-    puertos = list(serial.tools.list_ports.comports())
+    puertos = serial.tools.list_ports.comports()
     if not puertos:
-        print("⚠ No se detectaron puertos COM disponibles.")
+        print("⚠ No hay puertos disponibles.")
         return None
-    return puertos[0].device  # Usar el primero disponible automáticamente
 
-def conectar_router():
-    puerto = detectar_puerto_serial()
-    if not puerto:
-        return None
+    print("🔌 Puertos detectados:")
+    for i, p in enumerate(puertos):
+        print(f"{i}: {p.device} - {p.description}")
+
+    if len(puertos) == 1:
+        print(f"✅ Se detectó automáticamente: {puertos[0].device}")
+        return puertos[0].device
+
+    seleccion = input("Selecciona el número o escribe el nombre del puerto: ").strip()
+    if seleccion.isdigit():
+        idx = int(seleccion)
+        if 0 <= idx < len(puertos):
+            return puertos[idx].device
+        else:
+            print("⚠ Número fuera de rango.")
+            return None
+    else:
+        return seleccion
+
+def conectar_serial(port):
     try:
-        ser = serial.Serial(puerto, baudrate=9600, timeout=1)
-        print(f"✅ Conectado exitosamente a {puerto}")
+        ser = serial.Serial(port, baudrate=9600, timeout=1)
+        time.sleep(2)
+        print(f"✅ Conectado a {port}")
         return ser
     except Exception as e:
-        print(f"❌ Error al conectar con el puerto {puerto}: {e}")
+        print(f"❌ Error al conectar: {e}")
         return None
 
-def enviar_comando(ser, comando):
-    ser.write((comando + "\n").encode())
-    ser.flush()
-    salida = ""
-    while True:
-        linea = ser.readline().decode(errors="ignore")
-        if not linea:
-            break
-        salida += linea
-    return salida.strip()
+def send_command(ser, cmd, delay=2):
+    ser.reset_input_buffer()
+    ser.write((cmd + "\r\n").encode())
+    time.sleep(delay)
+    output = ser.read(ser.in_waiting).decode(errors="ignore")
+    return output.strip()
 
 # ╔════════════════════════════════════════════════════════════════╗
-#   FUNCIÓN PARA PARSEAR Y GUARDAR EN CSV (una fila por router)
+#   FUNCIONES PRINCIPALES
 # ╚════════════════════════════════════════════════════════════════╝
 
-def obtener_interfaces_csv_fila(ser):
-    # Obtener hostname
-    hostname_out = enviar_comando(ser, "show running-config | include hostname")
-    hostname = hostname_out.split()[-1] if "hostname" in hostname_out else "Desconocido"
-    print(f"🔹 Hostname detectado: {hostname}")
-
-    # Ejecutar show ip interface brief
-    salida = enviar_comando(ser, "show ip interface brief")
-    print(salida)
-
-    # Template TextFSM
-    template_path = os.path.join(os.getcwd(), "Value.txt")
-    if not os.path.exists(template_path):
-        print(f"⚠ No se encontró el template: {template_path}")
-        return
-
-    with open(template_path) as template:
-        fsm = textfsm.TextFSM(template)
-        resultados = fsm.ParseText(salida)
-
-    if not resultados:
-        print("⚠ No se pudieron extraer interfaces.")
-        return
-
-    # Crear diccionario para una sola fila
-    fila = {"Hostname": hostname}
-    for i, r in enumerate(resultados, start=1):
-        interface, ip, ok, method, status, protocol = r
-        fila[f"Interface_{i}"] = interface
-        fila[f"IP_{i}"] = ip
-        fila[f"Status_{i}"] = status
-        fila[f"Protocol_{i}"] = protocol
-
-    csv_file = "interfaces_una_fila.csv"
-    if os.path.exists(csv_file):
-        df_existente = pd.read_csv(csv_file)
-        df_final = pd.concat([df_existente, pd.DataFrame([fila])], ignore_index=True)
+def get_hostname(ser):
+    output = send_command(ser, "\n")
+    if "#" in output:
+        return output.split("#")[0].strip()
     else:
-        df_final = pd.DataFrame([fila])
+        send_command(ser, "show run | i hostname")
+        output = send_command(ser, "show run | i hostname")
+        if "hostname" in output:
+            return output.split("hostname")[-1].strip()
+    return "Desconocido"
 
-    df_final.to_csv(csv_file, index=False)
-    print(f"\n✅ Datos guardados correctamente en '{csv_file}'\n")
+def obtener_interfaces_textfsm(ser):
+    if not os.path.exists(TEMPLATE_FILE):
+        print(f"⚠ No se encontró el template: {TEMPLATE_FILE}")
+        print("Crea este archivo con el contenido correcto para 'show ip interface brief'.")
+        return None
+
+    print("📡 Ejecutando 'show ip interface brief'...")
+    output = send_command(ser, "show ip interface brief", delay=3)
+    with open(TEMPLATE_FILE) as template:
+        fsm = textfsm.TextFSM(template)
+        try:
+            result = fsm.ParseText(output)
+            headers = fsm.header
+            df = pd.DataFrame(result, columns=headers)
+            return df
+        except Exception as e:
+            print(f"⚠ Error al parsear: {e}")
+            print("Salida cruda del dispositivo:")
+            print(output)
+            return None
+
+def guardar_interfaces_en_csv(hostname, df):
+    if df is None or df.empty:
+        print("⚠ No hay datos para guardar.")
+        return
+
+    # Aplanar la info en una sola fila
+    data = {"Hostname": hostname}
+    for i, row in df.iterrows():
+        for col in df.columns:
+            data[f"{col}_{i+1}"] = row[col]
+
+    if os.path.exists(CSV_FILE):
+        df_csv = pd.read_csv(CSV_FILE)
+        if hostname in df_csv["Hostname"].values:
+            df_csv.loc[df_csv["Hostname"] == hostname, data.keys()] = data.values()
+        else:
+            df_csv = pd.concat([df_csv, pd.DataFrame([data])], ignore_index=True)
+    else:
+        df_csv = pd.DataFrame([data])
+
+    df_csv.to_csv(CSV_FILE, index=False)
+    print(f"✅ Datos guardados/actualizados en {CSV_FILE}")
 
 # ╔════════════════════════════════════════════════════════════════╗
-#   MENÚ PRINCIPAL
+#   MENÚ
 # ╚════════════════════════════════════════════════════════════════╝
 
 def menu():
-    ser = conectar_router()
+    port = detectar_puerto_serial()
+    if not port:
+        return
+    ser = conectar_serial(port)
     if not ser:
         return
 
     while True:
         print("""
-╔════════════════════════════════════════════╗
-║             MENÚ PRINCIPAL                ║
-╚════════════════════════════════════════════╝
+╔════════════════════════════════════════╗
+║              MENÚ PRINCIPAL             ║
+╚════════════════════════════════════════╝
 1. Comandos manuales
-2. Obtener interfaces (TextFSM, una fila)
+2. Obtener interfaces (TextFSM, una fila por router)
 0. Salir
 """)
-        opcion = input("Selecciona una opción: ")
+        opcion = input("Selecciona una opción: ").strip()
+
         if opcion == "1":
             while True:
-                cmd = input("Router# ")
-                if cmd.lower() == "exit":
+                cmd = input("Router# ").strip()
+                if cmd.lower() in ["exit", "salir"]:
                     break
-                salida = enviar_comando(ser, cmd)
-                print(salida)
+                output = send_command(ser, cmd, delay=2)
+                print(output)
+
         elif opcion == "2":
-            obtener_interfaces_csv_fila(ser)
+            hostname = get_hostname(ser)
+            print(f"🔹 Hostname detectado: {hostname}")
+            df = obtener_interfaces_textfsm(ser)
+            if df is not None:
+                guardar_interfaces_en_csv(hostname, df)
+            else:
+                print("⚠ No se pudieron extraer interfaces.")
             input("Presiona ENTER para volver al menú...")
+
         elif opcion == "0":
             ser.close()
+            print("👋 Conexión cerrada.")
             break
         else:
-            print("⚠ Opción no válida.")
+            print("❌ Opción inválida.")
+            time.sleep(1)
 
 # ╔════════════════════════════════════════════════════════════════╗
 #   MAIN
 # ╚════════════════════════════════════════════════════════════════╝
-
 if __name__ == "__main__":
     menu()
