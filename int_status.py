@@ -101,14 +101,24 @@ def guardar_interfaces_en_csv(hostname, df):
         for col in df.columns:
             data[f"{col}_{i+1}"] = row[col]
 
+    # --- 🔧 CORRECCIÓN AQUÍ ---
     if os.path.exists(CSV_FILE):
         df_csv = pd.read_csv(CSV_FILE)
+
+        # Si ya existe el hostname, actualiza esa fila
         if hostname in df_csv["Hostname"].values:
-            df_csv.loc[df_csv["Hostname"] == hostname, data.keys()] = data.values()
+            idx = df_csv.index[df_csv["Hostname"] == hostname][0]
+            for k, v in data.items():
+                df_csv.loc[idx, k] = v
         else:
+            # Agrega un nuevo router
             df_csv = pd.concat([df_csv, pd.DataFrame([data])], ignore_index=True)
     else:
+        # Si no existe el archivo, créalo con el router actual
         df_csv = pd.DataFrame([data])
+
+    # Rellenar NaN con vacío para evitar errores de escritura
+    df_csv = df_csv.fillna("")
 
     df_csv.to_csv(CSV_FILE, index=False)
     print(f"✅ Datos guardados/actualizados en {CSV_FILE}")
@@ -131,7 +141,7 @@ def menu():
 ║              MENÚ PRINCIPAL             ║
 ╚════════════════════════════════════════╝
 1. Comandos manuales
-2. Obtener interfaces (TextFSM, una fila por router)
+2. Obtener interfaces
 0. Salir
 """)
         opcion = input("Selecciona una opción: ").strip()
