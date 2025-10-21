@@ -1,151 +1,193 @@
-#!/usr/bin/env python3
-"""Autor: Ing. Fernndo + Vane ⚡
-Descripción:
-    Script que pregunta una IP de dispositivo (host o switch)
-    y busca en los switches definidos a qué puerto y switch está conectado.
-Requiere:
-    pip install netmiko pandas
-"""
-
 from netmiko import ConnectHandler
 import re
 import pandas as pd
 import os
 
+ROOT_SWITCH = {
+    "device_type": "cisco_ios",
+    "host": "192.168.1.1",  # switch core
+    "username": "cisco",
+    "password": "cisco99",
+}
 
-# ========================================================
-# CONFIGURA AQUÍ TUS SWITCHES
-# ========================================================
-SWITCHES = [
-    {
-        "device_type": "cisco_ios",
-        "host": "192.168.1.1",
-        "username": "cisco",
-        "password": "cisco99",
-    },
-    # Puedes agregar más switches si tienes varios
-    # {"device_type": "cisco_ios", "host": "192.168.1.", "username": "admin", "password": "cisco"},
-]
+VISITADOS = set()
 
-
-# ========================================================
-# FUNCIONES AUXILIARES
-# ========================================================
 
 def limpiar():
     os.system("cls" if os.name == "nt" else "clear")
 
 
+def conectar(sw):
+    return ConnectHandler(**sw)
+
+
 def obtener_mac_por_ip(conn, ip):
-    """Ejecuta 'show ip arp' y busca la MAC asociada a una IP."""
-    output = conn.send_command("show ip arp", use_textfsm=False)
-    for line in output.splitlines():
-        if ip in line:
-            # Ejemplo de línea: Internet  192.168.1.10  0   0011.2233.4455  ARPA  Vlan10
-            m = re.search(rf"{ip}\s+\S+\s+([\w\.]+)\s+ARPA", line)
-            if m:
-                return m.group(1).replace('.', '').lower()
-    return None
-
-
-def normalizar_mac(mac_raw):
-    """Convierte una MAC 001122334455 o 0011.2233.4455 a formato estándar 00:11:22:33:44:55"""
-    mac = mac_raw.replace('.', '').replace(':', '').replace('-', '').lower()
-    if len(mac) == 12:
-        return ':'.join(mac[i:i+2] for i in range(0, 12, 2))
-    return mac_raw
-
-
-def buscar_en_switch(sw, ip_buscada):
-    """
-    Busca la IP en el switch, correlaciona con su MAC y puerto.
-    Retorna dict con resultados o None.
-    """
-    print(f"\n🔗 Conectando al switch {sw['host']} ...")
-    conn = ConnectHandler(**sw)
-    hostname = conn.find_prompt().replace("#", "").strip()
-
-    # Paso 1: Buscar la MAC asociada a la IP
-    mac_raw = obtener_mac_por_ip(conn, ip_buscada)
-    if not mac_raw:
-        print(f"⚠️  No se encontró la IP {ip_buscada} en el ARP de {hostname}")
-        conn.disconnect()
+    output = conn.send_command(f"show ip arp {ip}")
+    # Buscar formato como: Internet  192.168.1.10           3   001b.7842.0a00  ARPA
+    m = re.search(rf"Internet\s+{re.escape(ip)}\s+\S+\s+([0-9a-fA-F\.:-]+)\s+ARPA", output)
+    if not m:
         return None
+    mac = m.group(1)
+    # devolver en formato sin separadores (para comparar con salida de mac address-table)
+    return mac.replace('.', '').replace(':', '').replace('-', '').lower()
 
-    mac_norm = normalizar_mac(mac_raw)
-    print(f"✅ IP {ip_buscada} → MAC {mac_norm}")
 
-    # Paso 2: Buscar la MAC en la tabla de direcciones
-    output = conn.send_command("show mac address-table", use_textfsm=False)
+def normalizar_mac(mac):
+    mac = mac.replace('.', '').replace(':', '').replace('-', '').lower()
+    if len(mac) != 12:
+        return mac
+    return ':'.join(mac[i:i+2] for i in range(0, 12, 2))
+
+
+def buscar_mac_table(conn, mac):
+    """
+    Busca la MAC (sin separadores) en la tabla MAC y devuelve VLAN e interfaz.
+    """
+    output = conn.send_command("show mac address-table")
+    mac_n = mac.lower()
     for line in output.splitlines():
-        if mac_raw[:4] in line or mac_norm.replace(':', '')[:4] in line:
-            m = re.search(r"(?P<vlan>\d+)\s+(?P<mac>[0-9a-fA-F\.:-]{11,})\s+\S+\s+(?P<intf>\S+)", line)
+        clean = line.replace('.', '').replace(':', '').replace('-', '').lower()
+        if mac_n in clean:
+            # intentar parsear: VLAN MAC TYPE PORT
+            m = re.search(r"^(\s*\d+)\s+([0-9a-fA-F\.:-]+)\s+\S+\s+(\S+)$", line.strip())
             if m:
-                interface = m.group("intf")
-                conn.disconnect()
-                return {
-                    "sw_name": hostname,
-                    "ip_sw": sw["host"],
-                    "puerto_device": interface,
-                    "mac_device": mac_norm,
-                    "ip_device": ip_buscada,
-                }
-
-    conn.disconnect()
+                vlan = m.group(1).strip()
+                intf = m.group(3).strip()
+                return {"vlan": vlan, "intf": intf}
+            # si no concuerda regex simple por columnas
+            parts = line.split()
+            if len(parts) >= 4:
+                return {"vlan": parts[0], "intf": parts[-1]}
     return None
 
 
-# ========================================================
-# MENÚ PRINCIPAL
-# ========================================================
+def obtener_ip_cdp_por_interfaz(conn, interfaz):
+    """
+    Ejecuta 'show cdp neighbors <intf> detail' y extrae la IP del vecino si existe.
+    Devuelve la IP como string o None.
+    """
+    out = conn.send_command(f"show cdp neighbors {interfaz} detail")
+    # Buscar líneas con IP address: 10.0.0.1
+    m = re.search(r"IP address:\s*(\d+\.\d+\.\d+\.\d+)", out)
+    if m:
+        return m.group(1)
+    # Algunos dispositivos muestran 'IP address: 10.0.0.1' o 'Management address(es):\n  IP: 10.0.0.1'
+    m2 = re.search(r"IP\s*:\s*(\d+\.\d+\.\d+\.\d+)", out)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def interfaz_es_trunk(conn, interfaz):
+    """Devuelve True si la interfaz es trunk."""
+    out = conn.send_command(f"show interfaces {interfaz} switchport")
+    if "Administrative Mode: trunk" in out or "Operational Mode: trunk" in out:
+        return True
+    return False
+
+
+def obtener_ip_vlan(conn, vlan):
+    out = conn.send_command("show ip interface brief")
+    for line in out.splitlines():
+        if re.search(rf"Vlan{vlan}\b", line):
+            m = re.search(r"(Vlan\d+)\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if m:
+                return m.group(2)
+    return None
+
+
+def rastrear(sw, ip_buscada):
+    ruta = []
+    actual = sw
+
+    while True:
+        if actual["host"] in VISITADOS:
+            print(f"⚠️ Ya se visitó {actual['host']}, deteniendo bucle.")
+            break
+        VISITADOS.add(actual["host"])
+
+        print(f"\n🔗 Conectando a {actual['host']} ...")
+        conn = conectar(actual)
+        hostname = conn.find_prompt().replace("#", "").strip()
+
+        mac_raw = obtener_mac_por_ip(conn, ip_buscada)
+        if not mac_raw:
+            print(f"⚠️ No se encontró la IP {ip_buscada} en {hostname}")
+            conn.disconnect()
+            break
+
+        mac_norm = normalizar_mac(mac_raw)
+        print(f"✅ {hostname}: IP {ip_buscada} → MAC {mac_norm}")
+
+        info = buscar_mac_table(conn, mac_raw)
+        if not info:
+            print(f"⚠️ No se encontró la MAC {mac_norm} en {hostname}")
+            conn.disconnect()
+            break
+
+        vlan = info["vlan"]
+        intf = info["intf"]
+        print(f"🔎 MAC encontrada en {intf} (VLAN {vlan})")
+
+        # Primero comprobar si en esa interfaz hay un vecino CDP
+        vecino_ip = obtener_ip_cdp_por_interfaz(conn, intf)
+        if vecino_ip:
+            print(f"🔁 Se detectó vecino en {intf} con IP {vecino_ip} → conectando al switch vecino...")
+            ruta.append({"sw_name": hostname, "ip_sw": actual["host"], "puerto": intf, "vlan": vlan, "next_ip": vecino_ip})
+            conn.disconnect()
+            # preparar conexión al vecino y repetir búsqueda de la misma IP destino
+            actual = {
+                "device_type": "cisco_ios",
+                "host": vecino_ip,
+                "username": sw["username"],
+                "password": sw["password"],
+            }
+            continue
+
+        # Si no hay vecino CDP, puede ser un puerto de acceso hacia el host final
+        print(f"🏁 No se detectó vecino CDP en {intf}. Se asume dispositivo final conectado en {hostname}:{intf}")
+        ruta.append({
+            "sw_name": hostname,
+            "ip_sw": actual["host"],
+            "puerto": intf,
+            "vlan": vlan,
+            "mac_device": mac_norm,
+            "ip_device": ip_buscada,
+        })
+        conn.disconnect()
+        break
+
+    return ruta
+
 
 def menu():
     while True:
         limpiar()
-        print("="*55)
-        print("🔍  BUSCADOR DE DISPOSITIVO POR IP (via SSH + CDP/ARP/MAC)")
-        print("="*55)
-        print("1️⃣  Buscar IP en switches")
+        print("="*65)
+        print("🔍 Rastreador de IP (detección VLAN inter-switch)")
+        print("="*65)
+        print("1️⃣  Buscar IP")
         print("2️⃣  Salir")
-        print("="*55)
-
-        opcion = input("Selecciona una opción: ").strip()
+        print("="*65)
+        opcion = input("Selecciona una opción: ")
 
         if opcion == "1":
-            ip_buscar = input("\nIngresa la IP del dispositivo a buscar: ").strip()
-            resultados = []
+            ip = input("Ingresa la IP del dispositivo a buscar: ").strip()
+            print("\n🚀 Iniciando rastreo...\n")
+            ruta = rastrear(ROOT_SWITCH, ip)
 
-            for sw in SWITCHES:
-                try:
-                    res = buscar_en_switch(sw, ip_buscar)
-                    if res:
-                        resultados.append(res)
-                        break  # dejamos de buscar al encontrarlo
-                except Exception as e:
-                    print(f"❌ Error con {sw['host']}: {e}")
-
-            if resultados:
-                df = pd.DataFrame(resultados)
-                print("\n=== RESULTADO ENCONTRADO ===")
+            if ruta:
+                df = pd.DataFrame(ruta)
+                print("\n=== RUTA COMPLETA ===")
                 print(df.to_string(index=False))
-                df.to_csv("resultado_busqueda_ip.csv", index=False)
-                print("\n📄 Guardado en: resultado_busqueda_ip.csv")
+                df.to_csv("ruta_busqueda_ip.csv", index=False)
+                print("\n📄 Guardado en: ruta_busqueda_ip.csv")
             else:
-                print(f"\n⚠️ No se encontró la IP {ip_buscar} en ninguno de los switches.")
-
+                print("\n⚠️ No se encontró la IP en la red.")
             input("\nPresiona Enter para continuar...")
-
         elif opcion == "2":
-            print("\n👋 Saliendo del programa... ¡Nos vemos, ingeniero!")
             break
 
-        else:
-            print("\n⚠️ Opción no válida.")
-            input("\nPresiona Enter para continuar...")
 
-
-# ========================================================
-# EJECUCIÓN
-# ========================================================
 if __name__ == "__main__":
     menu()
