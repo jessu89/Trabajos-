@@ -2,6 +2,16 @@ from netmiko import ConnectHandler
 import re
 import pandas as pd
 import os
+import socket
+# Algunas instalaciones/linter no resuelven netmiko.ssh_exception; usar fallback seguro
+try:
+    from netmiko.ssh_exception import NetmikoTimeoutException, NetmikoAuthenticationException
+except Exception:
+    class NetmikoTimeoutException(Exception):
+        pass
+
+    class NetmikoAuthenticationException(Exception):
+        pass
 
 ROOT_SWITCH = {
     "device_type": "cisco_ios",
@@ -18,7 +28,21 @@ def limpiar():
 
 
 def conectar(sw):
-    return ConnectHandler(**sw)
+    # Intentar conectar y manejar excepciones para evitar que el script se caiga
+    try:
+        return ConnectHandler(**sw)
+    except (NetmikoTimeoutException, NetmikoAuthenticationException, OSError) as e:
+        print(f"⚠️ Error al conectar a {sw.get('host')}: {e}")
+        return None
+
+
+def puerto_abierto(host, port=22, timeout=2):
+    """Comprueba si el puerto TCP está abierto en el host (uso previo a intentar SSH)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
 def obtener_mac_por_ip(conn, ip):
@@ -107,7 +131,15 @@ def rastrear(sw, ip_buscada):
         VISITADOS.add(actual["host"])
 
         print(f"\n🔗 Conectando a {actual['host']} ...")
+        # Antes de intentar SSH, comprobar que el puerto 22 esté accesible
+        if not puerto_abierto(actual["host"]):
+            print(f"⚠️ No se puede alcanzar {actual['host']} en el puerto 22. Deteniendo este salto.")
+            break
+
         conn = conectar(actual)
+        if conn is None:
+            print(f"⚠️ Conexión SSH fallida a {actual['host']}, deteniendo rastreo desde este nodo.")
+            break
         hostname = conn.find_prompt().replace("#", "").strip()
 
         mac_raw = obtener_mac_por_ip(conn, ip_buscada)
@@ -174,6 +206,8 @@ def menu():
         if opcion == "1":
             ip = input("Ingresa la IP del dispositivo a buscar: ").strip()
             print("\n🚀 Iniciando rastreo...\n")
+            # Limpiar historial de nodos visitados para permitir nuevas búsquedas
+            VISITADOS.clear()
             ruta = rastrear(ROOT_SWITCH, ip)
 
             if ruta:
